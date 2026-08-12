@@ -1,0 +1,34 @@
+# Example service configuration
+
+SERVICE_NAME="example"
+SERVICE_USER="svc-example"
+
+# Supported:
+#   postgres
+#   none
+DB_TYPE="postgres"
+
+DB_CONTAINER="example-postgres"
+DB_NAME="example"
+DB_USER="example"
+
+# Host directories that must be backed up
+BACKUP_PATHS=(
+  "/home/svc-example/data"
+)
+
+# Rootless Podman named volumes that must be backed up
+BACKUP_VOLUMES=(
+  "example-data"
+)
+
+# Persistent mounts expected inside containers.
+# Format:
+#   container|mount-type|destination
+EXPECTED_MOUNTS=(
+  "example-postgres|volume|/var/lib/postgresql/data"
+  "example-app|volume|/usr/src/example/data"
+)
+
+# Optional HTTP smoke test
+HEALTH_URL="https://example.com/"

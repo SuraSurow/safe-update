@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Safe Update Pipeline daily
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+Persistent=true
+RandomizedDelaySec=10m
+Unit=safe-update.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,20 @@
+# Safe Update - example global configuration
+
+# Device used by Timeshift.
+# Example:
+#   /dev/vda4
+#   /dev/sda2
+#
+# Check your root filesystem with:
+#   findmnt -no SOURCE /
+TIMESHIFT_DEVICE="/dev/vda4"
+
+# Number of application backups to keep
+BACKUP_RETENTION=7
+
+# Number of safe-update Timeshift snapshots to keep
+SNAPSHOT_RETENTION=5
+
+# Health check limits
+ROOT_DISK_MAX_PERCENT=90
+MIN_AVAILABLE_MEMORY_MB=256

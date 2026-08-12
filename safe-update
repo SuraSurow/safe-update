@@ -1,0 +1,394 @@
+#!/bin/bash
+
+# Safe Update
+# Copyright (C) 2026 Wojciech Surowiecki
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed WITHOUT ANY WARRANTY; without even the implied
+# warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+# See the GNU Affero General Public License for more details.
+
+set -euo pipefail
+
+umask 077
+cd /tmp
+
+SCRIPT_DIR="$(
+    cd "$(dirname "${BASH_SOURCE[0]}")"
+    pwd
+)"
+
+BACKUP_BASE="/var/lib/safe-update/backups"
+UPDATE_CHECK_BASE="/var/lib/safe-update/update-check"
+
+source "$SCRIPT_DIR/lib/config.sh"
+load_global_config
+
+source "$SCRIPT_DIR/lib/backup.sh"
+source "$SCRIPT_DIR/lib/verify.sh"
+source "$SCRIPT_DIR/lib/report.sh"
+source "$SCRIPT_DIR/lib/retention.sh"
+source "$SCRIPT_DIR/lib/update-check.sh"
+source "$SCRIPT_DIR/lib/snapshot.sh"
+source "$SCRIPT_DIR/lib/health.sh"
+source "$SCRIPT_DIR/lib/update.sh"
+source "$SCRIPT_DIR/lib/rollback.sh"
+source "$SCRIPT_DIR/lib/inventory.sh"
+
+
+if [[ $EUID -ne 0 ]]; then
+    echo "ERROR: uruchom jako root."
+    exit 1
+fi
+
+COMMAND="${1:-}"
+
+do_check() {
+    local date
+    local run_dir
+    local count
+
+    date="$(date '+%Y-%m-%d_%H-%M-%S')"
+    run_dir="$UPDATE_CHECK_BASE/$date"
+
+    mkdir -p "$run_dir"
+
+    check_updates "$run_dir"
+
+    count="$(cat "$run_dir/update-count")"
+
+    echo
+
+    if [[ "$count" -eq 0 ]]; then
+        echo "========================================"
+        echo "SYSTEM UP TO DATE"
+        echo "Updates available: 0"
+        echo "========================================"
+        return 0
+    fi
+
+    echo "========================================"
+    echo "UPDATES AVAILABLE: $count"
+    echo "Report: $run_dir"
+    echo "========================================"
+}
+
+do_backup() {
+    local date
+    local started
+    local finished
+    local dest
+    local log
+    local config
+    local SERVICE_DEST
+    local i
+
+    date="$(date '+%Y-%m-%d_%H-%M-%S')"
+    started="$(date -Is)"
+
+    dest="$BACKUP_BASE/$date"
+
+    mkdir -p "$dest"
+
+    log="$dest/backup.log"
+    exec > >(tee -a "$log") 2>&1
+
+    echo "========================================"
+    echo " SAFE-UPDATE BACKUP"
+    echo " Start: $started"
+    echo "========================================"
+
+    echo
+    echo "=== INVENTORY ==="
+
+    run_inventory
+
+    echo
+    echo "=== BACKUP ==="
+
+    while IFS= read -r config; do
+        [[ -z "$config" ]] && continue
+
+        unset \
+            SERVICE_NAME SERVICE_USER \
+            DB_TYPE DB_CONTAINER DB_NAME DB_USER \
+            BACKUP_PATHS BACKUP_VOLUMES \
+            EXPECTED_MOUNTS HEALTH_URL
+
+        declare -a BACKUP_PATHS=()
+        declare -a BACKUP_VOLUMES=()
+        declare -a EXPECTED_MOUNTS=()
+
+        # shellcheck disable=SC1090
+        source "$config"
+
+        [[ -n "${SERVICE_NAME:-}" ]] || {
+            echo "ERROR: brak SERVICE_NAME w $config"
+            return 1
+        }
+
+        [[ -n "${SERVICE_USER:-}" ]] || {
+            echo "ERROR: brak SERVICE_USER w $config"
+            return 1
+        }
+
+        echo
+        echo "--- SERVICE: $SERVICE_NAME ---"
+
+        SERVICE_DEST="$dest/$SERVICE_NAME"
+        mkdir -p "$SERVICE_DEST"
+
+        case "${DB_TYPE:-none}" in
+            postgres)
+                backup_postgres \
+                    "$SERVICE_USER" \
+                    "$DB_CONTAINER" \
+                    "$DB_USER" \
+                    "$DB_NAME" \
+                    "$SERVICE_DEST/database.dump"
+
+                verify_postgres_dump \
+                    "$SERVICE_USER" \
+                    "$DB_CONTAINER" \
+                    "$SERVICE_DEST/database.dump"
+                ;;
+
+            none)
+                echo "[DB] none"
+                ;;
+
+            *)
+                echo "ERROR: nieobsługiwany DB_TYPE: $DB_TYPE"
+                return 1
+                ;;
+        esac
+
+        i=0
+
+        for path in "${BACKUP_PATHS[@]}"; do
+            ((i+=1))
+
+            backup_path \
+                "$path" \
+                "$SERVICE_DEST/path-${i}.tar.gz"
+        done
+
+        i=0
+
+        for volume in "${BACKUP_VOLUMES[@]}"; do
+            ((i+=1))
+
+            backup_volume \
+                "$SERVICE_USER" \
+                "$volume" \
+                "$SERVICE_DEST/volume-${i}.tar.gz"
+        done
+
+    done < <(get_service_configs)
+
+    echo
+    echo "=== CHECKSUMS ==="
+
+    (
+        cd "$dest"
+
+        find . -type f \
+            ! -name SHA256SUMS \
+            ! -name backup.log \
+            ! -name report.md \
+            -print0 |
+        sort -z |
+        xargs -0 sha256sum > SHA256SUMS
+    )
+
+    echo
+    echo "=== VERIFY ARCHIVES ==="
+
+    while IFS= read -r -d '' archive; do
+        verify_tar "$archive"
+    done < <(
+        find "$dest" -type f -name '*.tar.gz' -print0
+    )
+
+    echo
+    echo "=== VERIFY CHECKSUMS ==="
+
+    verify_checksums "$dest"
+
+    echo
+    echo "=== SIZE ==="
+
+    du -sh "$dest"
+
+    finished="$(date -Is)"
+
+    echo
+    echo "=== REPORT ==="
+
+    generate_report "$dest" "$started" "$finished"
+
+    echo "[OK] report.md created"
+
+    echo
+    echo "=== RETENTION ==="
+
+    apply_retention "$BACKUP_BASE"
+
+    echo
+    echo "========================================"
+    echo "BACKUP VERIFIED: PASS"
+    echo "Location: $dest"
+    echo "Finished: $finished"
+    echo "========================================"
+}
+
+do_run() {
+    local date
+    local run_dir
+    local count
+
+    date="$(date '+%Y-%m-%d_%H-%M-%S')"
+    run_dir="$UPDATE_CHECK_BASE/$date"
+
+    mkdir -p "$run_dir"
+
+    echo "========================================"
+    echo " SAFE-UPDATE RUN"
+    echo " Start: $(date -Is)"
+    echo "========================================"
+
+    echo
+    echo "=== UPDATE CHECK ==="
+
+    check_updates "$run_dir"
+
+    count="$(cat "$run_dir/update-count")"
+
+    if [[ "$count" -eq 0 ]]; then
+        echo
+        echo "========================================"
+        echo "SYSTEM UP TO DATE"
+        echo "Updates available: 0"
+        echo "No backup required."
+        echo "No snapshot required."
+        echo "SAFE-UPDATE STOP"
+        echo "========================================"
+        return 0
+    fi
+
+    echo
+    echo "Updates detected: $count"
+
+    echo
+    echo "=== PRE-UPDATE HEALTH CHECK ==="
+
+    run_health_check "$run_dir" "pre"
+
+    echo
+    echo "Pre-update health check: PASS"
+
+    echo
+    echo "=== DATA BACKUP ==="
+
+    do_backup
+
+    echo
+    echo "=== SYSTEM SNAPSHOT ==="
+
+    create_system_snapshot "$run_dir"
+
+    echo
+    echo "=== SYSTEM UPDATE ==="
+
+    run_system_update "$run_dir"
+
+    echo
+    echo "=== POST-UPDATE HEALTH CHECK ==="
+
+    if run_health_check "$run_dir" "post"; then
+
+        echo
+        echo "========================================"
+        echo "SAFE-UPDATE: PASS"
+        echo "Update installed successfully."
+        echo "Post-update health check: PASS."
+        echo "System snapshot retained for rollback."
+        echo "========================================"
+
+        echo
+        echo "=== SNAPSHOT RETENTION ==="
+
+        apply_snapshot_retention
+
+        echo
+        echo "========================================"
+        echo "SAFE-UPDATE FINISHED SUCCESSFULLY"
+        echo "Finished: $(date -Is)"
+        echo "========================================"
+
+    else
+
+        echo
+        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+        echo "SAFE-UPDATE: FAIL"
+        echo "Post-update health check failed."
+        echo "DO NOT DELETE THE PRE-UPDATE SNAPSHOT."
+        echo
+        echo "Rollback snapshot:"
+
+        if [[ -f "$run_dir/system-snapshot-name" ]]; then
+            cat "$run_dir/system-snapshot-name"
+        else
+            echo "ERROR: snapshot name file missing"
+        fi
+
+        echo
+        echo "Automatic rollback is NOT enabled."
+        echo "Use:"
+        echo "  safe-update rollback SNAPSHOT_NAME"
+        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+
+        return 1
+    fi
+}
+
+case "$COMMAND" in
+    check)
+        do_check
+        ;;
+
+    backup)
+        do_backup
+        ;;
+
+    run)
+        do_run
+        ;;
+
+    rollback)
+        SNAPSHOT_NAME="${2:-}"
+
+        if [[ -z "$SNAPSHOT_NAME" ]]; then
+            echo "Usage:"
+            echo "  safe-update rollback SNAPSHOT_NAME"
+            exit 1
+        fi
+
+        rollback_snapshot "$SNAPSHOT_NAME"
+        ;;
+
+    *)
+        echo "Usage:"
+        echo "  safe-update check"
+        echo "  safe-update backup"
+        echo "  safe-update run"
+        echo "  safe-update rollback SNAPSHOT_NAME"
+        exit 1
+        ;;
+esac
